@@ -36,13 +36,31 @@ case "list":
 case "route":
     guard let app = arg("--app"), let deviceMatch = arg("--device") else { printUsage(); exit(1) }
 
-    guard let proc = listAudioProcesses().first(where: {
+    let processMatches = listAudioProcesses().filter {
         ($0.bundleID ?? "").localizedCaseInsensitiveContains(app)
-    }) else { print("✗ No audio process matching '\(app)'. Is it open/playing?"); exit(1) }
+    }
+    guard processMatches.count == 1, let proc = processMatches.first else {
+        if processMatches.isEmpty {
+            print("✗ No audio process matching '\(app)'. Is it open/playing?")
+        } else {
+            print("✗ App match is ambiguous; use a more specific bundle ID:")
+            for match in processMatches { print("  \(match.bundleID ?? "(no bundle id)")") }
+        }
+        exit(1)
+    }
 
-    guard let device = listOutputDevices().first(where: {
+    let deviceMatches = listOutputDevices().filter {
         $0.name.localizedCaseInsensitiveContains(deviceMatch)
-    }) else { print("✗ No output device matching '\(deviceMatch)'."); exit(1) }
+    }
+    guard deviceMatches.count == 1, let device = deviceMatches.first else {
+        if deviceMatches.isEmpty {
+            print("✗ No output device matching '\(deviceMatch)'.")
+        } else {
+            print("✗ Output match is ambiguous; use a more specific device name:")
+            for match in deviceMatches { print("  \(match.name)") }
+        }
+        exit(1)
+    }
 
     let router = ProcessAudioRouter()
     router.verbose = true

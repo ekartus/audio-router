@@ -1,6 +1,7 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
+import os
 
 /// Routes one process's audio to a chosen output device using a Core Audio
 /// process tap (macOS 14.2+), with a decoupled capture→playback path:
@@ -26,12 +27,33 @@ public final class ProcessAudioRouter {
     private var ring: AudioRingBuffer?
     private var prerollFrames = 0
     private var draining = false   // consumer state: false until buffer pre-fills
+    private var lastFrame: [Float] = []
+
+    // Meter values are shared by realtime callbacks and the UI/timer.
+    private let meterLock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
 
     // Metering (written from realtime callbacks, read/reset on main thread).
     fileprivate var meterOutPeak: Float = 0
     fileprivate var meterUnderflows = 0
     fileprivate var meterOverflows = 0
     fileprivate var meterBadSamples = 0
+
+    private func updateMeter(_ body: () -> Void) {
+        os_unfair_lock_lock(meterLock)
+        body()
+        os_unfair_lock_unlock(meterLock)
+    }
+
+    private func takeMeter() -> (peak: Float, underflows: Int, overflows: Int, badSamples: Int) {
+        os_unfair_lock_lock(meterLock)
+        let result = (meterOutPeak, meterUnderflows, meterOverflows, meterBadSamples)
+        meterOutPeak = 0
+        meterUnderflows = 0
+        meterOverflows = 0
+        meterBadSamples = 0
+        os_unfair_lock_unlock(meterLock)
+        return result
+    }
 
     private func describe(_ f: AudioStreamBasicDescription) -> String {
         let flags = f.mFormatFlags
@@ -48,6 +70,8 @@ public final class ProcessAudioRouter {
         case aggregateCreateFailed(OSStatus)
         case ioProcFailed(String, OSStatus)
         case startFailed(String, OSStatus)
+        case unsupportedFormat(String)
+        case alreadyRunning
 
         public var description: String {
             switch self {
@@ -57,12 +81,34 @@ public final class ProcessAudioRouter {
             case .aggregateCreateFailed(let s): return "AudioHardwareCreateAggregateDevice failed: \(s)."
             case .ioProcFailed(let w, let s): return "\(w) IOProc create failed: \(s)."
             case .startFailed(let w, let s): return "\(w) start failed: \(s)."
+            case .unsupportedFormat(let f): return "Unsupported audio format: \(f)."
+            case .alreadyRunning: return "This router is already running."
             }
+        }
+    }
+
+    private func validate(_ format: AudioStreamBasicDescription, label: String) throws {
+        let flags = format.mFormatFlags
+        let valid = format.mFormatID == kAudioFormatLinearPCM &&
+            (flags & kAudioFormatFlagIsFloat) != 0 &&
+            (flags & kAudioFormatFlagIsPacked) != 0 &&
+            (flags & kAudioFormatFlagIsNonInterleaved) == 0 &&
+            format.mBitsPerChannel == 32 &&
+            format.mBytesPerFrame == format.mChannelsPerFrame * 4 &&
+            format.mBytesPerPacket == format.mBytesPerFrame &&
+            format.mChannelsPerFrame > 0 &&
+            format.mSampleRate.isFinite && format.mSampleRate > 0
+        guard valid else {
+            throw RouterError.unsupportedFormat("\(label): \(describe(format)); expected interleaved 32-bit Float32 PCM")
         }
     }
 
     /// Start routing an already-resolved process object to an output device.
     public func start(processObjectID: AudioObjectID, deviceID: AudioDeviceID, deviceName: String = "") throws {
+        guard tapID == kAudioObjectUnknown, captureAggID == kAudioObjectUnknown,
+              captureProcID == nil, dacProcID == nil else { throw RouterError.alreadyRunning }
+        var started = false
+        defer { if !started { stop() } }
         dacID = deviceID
 
         log("→ Tapping process \(processObjectID) → \(deviceName.isEmpty ? String(deviceID) : deviceName) [direct output]")
@@ -76,10 +122,24 @@ public final class ProcessAudioRouter {
         var status = AudioHardwareCreateProcessTap(desc, &tapID)
         guard status == noErr, tapID != kAudioObjectUnknown else { throw RouterError.tapCreateFailed(status) }
 
-        let tapFormat = CA.format(tapID, kAudioTapPropertyFormat)
-        if let tf = tapFormat { log("   tap format:  \(describe(tf))") }
-        let channels = Int(tapFormat?.mChannelsPerFrame ?? 2)
-        let sampleRate = tapFormat?.mSampleRate ?? 48000
+        guard let tapFormat = CA.format(tapID, kAudioTapPropertyFormat) else {
+            throw RouterError.unsupportedFormat("tap format unavailable")
+        }
+        try validate(tapFormat, label: "tap")
+        log("   tap format:  \(describe(tapFormat))")
+        let channels = Int(tapFormat.mChannelsPerFrame)
+        let sampleRate = tapFormat.mSampleRate
+        guard let dacFormat = CA.format(deviceID, kAudioDevicePropertyStreamFormat,
+                                        scope: kAudioObjectPropertyScopeOutput) else {
+            throw RouterError.unsupportedFormat("output device format unavailable")
+        }
+        try validate(dacFormat, label: "output")
+        guard dacFormat.mChannelsPerFrame == tapFormat.mChannelsPerFrame else {
+            throw RouterError.unsupportedFormat("tap has \(tapFormat.mChannelsPerFrame) channels but output has \(dacFormat.mChannelsPerFrame)")
+        }
+        guard abs(dacFormat.mSampleRate - sampleRate) < 0.5 else {
+            throw RouterError.unsupportedFormat("tap is \(sampleRate) Hz but output is \(dacFormat.mSampleRate) Hz")
+        }
 
         // 3. Capture aggregate: contains ONLY the tap (no hardware sub-device).
         let aggUID = "com.mixerpoc.capture.\(UUID().uuidString)"
@@ -98,19 +158,23 @@ public final class ProcessAudioRouter {
         guard status == noErr, captureAggID != kAudioObjectUnknown else { throw RouterError.aggregateCreateFailed(status) }
 
         // 4. Ring buffer: ~500ms capacity, start draining once ~120ms buffered.
-        let ring = AudioRingBuffer(capacityFrames: Int(sampleRate * 0.5), channels: channels)
+        let capacityFrames = Int(sampleRate * 0.5)
+        guard capacityFrames > 0 else { throw RouterError.unsupportedFormat("invalid buffer capacity") }
+        let ring = AudioRingBuffer(capacityFrames: capacityFrames, channels: channels)
         self.ring = ring
         prerollFrames = Int(sampleRate * 0.12)
         draining = false
+        lastFrame = Array(repeating: 0, count: channels)
 
         // 5. Capture IOProc: tap input → ring buffer.
         status = AudioDeviceCreateIOProcIDWithBlock(&captureProcID, captureAggID, nil) { [weak self] (_, inInputData, _, _, _) in
             guard let self = self, let ring = self.ring else { return }
             let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
-            guard input.count > 0, let data = input[0].mData else { return }
+            guard input.count == 1, input[0].mNumberChannels == UInt32(ring.channels),
+                  let data = input[0].mData else { return }
             let frames = Int(input[0].mDataByteSize) / (ring.channels * MemoryLayout<Float>.size)
             let dropped = ring.write(data.assumingMemoryBound(to: Float.self), frames: frames)
-            if dropped > 0 { self.meterOverflows += dropped }
+            if dropped > 0 { self.updateMeter { self.meterOverflows += dropped } }
         }
         guard status == noErr, let capProc = captureProcID else { throw RouterError.ioProcFailed("capture", status) }
 
@@ -119,9 +183,11 @@ public final class ProcessAudioRouter {
             let output = UnsafeMutableAudioBufferListPointer(outOutputData)
             for buf in output { if let d = buf.mData { memset(d, 0, Int(buf.mDataByteSize)) } }
             guard let self = self, let ring = self.ring,
-                  output.count > 0, let dst = output[0].mData else { return }
+                  output.count == 1, output[0].mNumberChannels == UInt32(ring.channels),
+                  let dst = output[0].mData else { return }
 
             let frames = Int(output[0].mDataByteSize) / (ring.channels * MemoryLayout<Float>.size)
+            guard frames > 0 else { return }
             let fp = dst.assumingMemoryBound(to: Float.self)
 
             // Pre-roll: stay silent until the buffer has built up a safety margin,
@@ -131,9 +197,18 @@ public final class ProcessAudioRouter {
                 else { return }   // output already zeroed = silence
             }
 
-            let underflow = ring.read(fp, frames: frames)
+            let fillBeforeRead = ring.fillFrames
+            let lowWater = ring.capacityFrames / 5
+            let highWater = ring.capacityFrames * 4 / 5
+            let repeatFrame = fillBeforeRead <= lowWater && frames > 1
+            let framesToRead = repeatFrame ? frames - 1 : frames
+            let underflow = ring.read(fp, frames: framesToRead)
+            if repeatFrame && underflow == 0 {
+                for c in 0..<ring.channels { fp[(frames - 1) * ring.channels + c] = self.lastFrame[c] }
+            }
+            if fillBeforeRead >= highWater && underflow == 0 { ring.discard(frames: 1) }
             if underflow > 0 {
-                self.meterUnderflows += underflow
+                self.updateMeter { self.meterUnderflows += underflow }
                 if ring.fillFrames == 0 { self.draining = false }   // re-buffer
             }
 
@@ -142,12 +217,13 @@ public final class ProcessAudioRouter {
             let n = frames * ring.channels
             for j in 0..<n {
                 var v = fp[j]
-                if !v.isFinite { v = 0; self.meterBadSamples += 1 }
+                if !v.isFinite { v = 0; self.updateMeter { self.meterBadSamples += 1 } }
                 let a = abs(v); if a > peak { peak = a }
                 if v > 1 { v = 1 } else if v < -1 { v = -1 }
                 fp[j] = v
             }
-            if peak > self.meterOutPeak { self.meterOutPeak = peak }
+            for c in 0..<ring.channels { self.lastFrame[c] = fp[(frames - 1) * ring.channels + c] }
+            self.updateMeter { if peak > self.meterOutPeak { self.meterOutPeak = peak } }
         }
         guard status == noErr, let dacProc = dacProcID else { throw RouterError.ioProcFailed("DAC", status) }
 
@@ -165,30 +241,33 @@ public final class ProcessAudioRouter {
             timer.setEventHandler { [weak self] in
                 guard let self = self, let ring = self.ring else { return }
                 let fillMs = Double(ring.fillFrames) / sr * 1000
-                let peak = self.meterOutPeak
-                let flag = (self.meterUnderflows > 0 || self.meterOverflows > 0 || self.meterBadSamples > 0) ? "  <-- GLITCH" : ""
+                let meter = self.takeMeter()
+                let flag = (meter.underflows > 0 || meter.overflows > 0 || meter.badSamples > 0) ? "  <-- GLITCH" : ""
                 print(String(format: "   meter: out peak %.3f  buffer %.0f ms  underflow=%d overflow=%d bad=%d%@",
-                             peak, fillMs, self.meterUnderflows, self.meterOverflows, self.meterBadSamples, flag))
-                self.meterOutPeak = 0
-                self.meterUnderflows = 0
-                self.meterOverflows = 0
-                self.meterBadSamples = 0
+                             meter.peak, fillMs, meter.underflows, meter.overflows, meter.badSamples, flag))
             }
             timer.resume()
             meterTimer = timer
         }
 
+        started = true
         log("✓ Routing live (decoupled).")
     }
 
-    public init() {}
+    public init() {
+        meterLock.initialize(to: os_unfair_lock())
+    }
+
+    deinit {
+        stop()
+        meterLock.deinitialize(count: 1)
+        meterLock.deallocate()
+    }
 
     /// Peak output level (0…1) since the last call, then resets. Drives the UI
-    /// activity meter. Written from the realtime callback; a benign race for a meter.
+    /// activity meter. Access is synchronized with the realtime callback.
     public func readLevel() -> Float {
-        let v = meterOutPeak
-        meterOutPeak = 0
-        return v
+        takeMeter().peak
     }
 
     public func stop() {
@@ -211,5 +290,9 @@ public final class ProcessAudioRouter {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = kAudioObjectUnknown
         }
+        dacID = kAudioObjectUnknown
+        ring = nil
+        lastFrame.removeAll(keepingCapacity: false)
+        draining = false
     }
 }

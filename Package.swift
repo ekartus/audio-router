@@ -23,6 +23,11 @@ let package = Package(
             name: "MixerApp",
             dependencies: ["MixerCore"],
             path: "Sources/MixerApp"
+        ),
+        .testTarget(
+            name: "MixerCoreTests",
+            dependencies: ["MixerCore"],
+            path: "Tests/MixerCoreTests"
         )
     ]
 )

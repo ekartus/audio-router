@@ -86,4 +86,17 @@ final class AudioRingBuffer {
         }
         return frames - toRead
     }
+
+    /// Consumer-side clock correction. Discarding a single frame at a high
+    /// watermark prevents a small producer/consumer clock mismatch from
+    /// eventually filling the buffer and dropping a large block.
+    func discard(frames: Int) {
+        guard frames > 0 else { return }
+        let (r, w) = indices()
+        let toDiscard = min(frames, max(0, w - r))
+        guard toDiscard > 0 else { return }
+        os_unfair_lock_lock(lock)
+        readFrame = r + toDiscard
+        os_unfair_lock_unlock(lock)
+    }
 }

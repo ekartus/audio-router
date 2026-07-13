@@ -25,7 +25,12 @@ public final class RouteEngine: ObservableObject {
     public func isActive(_ id: UUID) -> Bool { routers[id] != nil }
 
     public init() {
-        rules = RulesStore.load()
+        let loadedRules = RulesStore.load()
+        var seenBundleIDs = Set<String>()
+        rules = loadedRules.filter { rule in
+            seenBundleIDs.insert(rule.appBundleID.lowercased()).inserted
+        }
+        if rules.count != loadedRules.count { RulesStore.save(rules) }
         defaultOutput = defaultOutputDevice()
         for r in rules { statuses[r.id] = r.enabled ? .waiting("starting…") : .inactive }
         timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
@@ -37,6 +42,11 @@ public final class RouteEngine: ObservableObject {
     // MARK: Rule editing
 
     public func add(_ rule: RoutingRule) {
+        // One source app may only have one route. Multiple muted taps for the
+        // same process can steal audio from each other and duplicate output.
+        guard !rules.contains(where: {
+            $0.appBundleID.caseInsensitiveCompare(rule.appBundleID) == .orderedSame
+        }) else { return }
         rules.append(rule)
         statuses[rule.id] = rule.enabled ? .waiting("starting…") : .inactive
         persistAndReconcile()
@@ -103,6 +113,9 @@ public final class RouteEngine: ObservableObject {
                 routers[rule.id] = router
                 statuses[rule.id] = .active
             } catch {
+                // start() is transactional, but keep this cleanup here as a
+                // second line of defense if a future startup step changes.
+                router.stop()
                 statuses[rule.id] = .error("\(error)")
             }
         }
@@ -116,5 +129,8 @@ public final class RouteEngine: ObservableObject {
     public func stopAll() {
         for (_, r) in routers { r.stop() }
         routers.removeAll()
+        for rule in rules where rule.enabled {
+            statuses[rule.id] = .waiting("stopped")
+        }
     }
 }
