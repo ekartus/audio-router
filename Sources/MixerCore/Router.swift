@@ -25,6 +25,7 @@ public final class ProcessAudioRouter {
 
     private var ring: AudioRingBuffer?
     private var prerollFrames = 0
+    private var maxFillFrames = 0  // high-water mark for drift compensation
     private var draining = false   // consumer state: false until buffer pre-fills
 
     // Metering (written from realtime callbacks, read/reset on main thread).
@@ -97,10 +98,12 @@ public final class ProcessAudioRouter {
         status = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &captureAggID)
         guard status == noErr, captureAggID != kAudioObjectUnknown else { throw RouterError.aggregateCreateFailed(status) }
 
-        // 4. Ring buffer: ~500ms capacity, start draining once ~120ms buffered.
-        let ring = AudioRingBuffer(capacityFrames: Int(sampleRate * 0.5), channels: channels)
+        // 4. Ring buffer: ~1s capacity, start draining once ~150ms buffered.
+        //    High-water mark (~450ms) triggers drift compensation.
+        let ring = AudioRingBuffer(capacityFrames: Int(sampleRate * 1.0), channels: channels)
         self.ring = ring
-        prerollFrames = Int(sampleRate * 0.12)
+        prerollFrames = Int(sampleRate * 0.15)
+        maxFillFrames = Int(sampleRate * 0.45)
         draining = false
 
         // 5. Capture IOProc: tap input → ring buffer.
@@ -129,6 +132,14 @@ public final class ProcessAudioRouter {
             if !self.draining {
                 if ring.fillFrames >= self.prerollFrames { self.draining = true }
                 else { return }   // output already zeroed = silence
+            }
+
+            // Drift compensation: if latency has grown past the high-water mark
+            // (producer clock outrunning the DAC), drop the oldest excess back to
+            // the pre-roll target. One tiny skip beats an ever-growing lag.
+            if ring.fillFrames > self.maxFillFrames {
+                ring.dropOldest(ring.fillFrames - self.prerollFrames)
+                self.meterOverflows += 1
             }
 
             let underflow = ring.read(fp, frames: frames)

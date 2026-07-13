@@ -65,6 +65,19 @@ final class AudioRingBuffer {
         return frames - toWrite
     }
 
+    /// Consumer: discard the oldest `frames` (drift compensation — keeps latency
+    /// bounded when the producer's clock outruns the consumer's). Consumer-side
+    /// only, so it's safe to advance the read index here.
+    func dropOldest(_ frames: Int) {
+        let (r, w) = indices()
+        let drop = min(frames, w - r)
+        if drop > 0 {
+            os_unfair_lock_lock(lock)
+            readFrame = r + drop
+            os_unfair_lock_unlock(lock)
+        }
+    }
+
     /// Consumer: copy up to `frames` interleaved frames into `dst`.
     /// Any shortfall is left untouched (caller must have zeroed `dst`).
     /// Returns the underflow frame count (frames we couldn't supply).
