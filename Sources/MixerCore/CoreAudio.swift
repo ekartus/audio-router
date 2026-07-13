@@ -124,3 +124,18 @@ public func audioProcess(forBundleID bundleID: String) -> AudioProcessInfo? {
 public func outputDevice(forUID uid: String) -> AudioDeviceInfo? {
     listOutputDevices().first { $0.uid == uid }
 }
+
+/// The current system default output device — where all un-routed audio goes.
+public func defaultOutputDevice() -> AudioDeviceInfo? {
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                             mScope: kAudioObjectPropertyScopeGlobal,
+                                             mElement: kAudioObjectPropertyElementMain)
+    var devID = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &devID) == noErr,
+          devID != 0 else { return nil }
+    let uid = CA.string(devID, kAudioDevicePropertyDeviceUID) ?? "?"
+    let name = CA.string(devID, kAudioObjectPropertyName) ?? "Unknown"
+    let out = CA.channelCount(devID, scope: kAudioObjectPropertyScopeOutput)
+    return AudioDeviceInfo(id: devID, uid: uid, name: name, outputChannels: out)
+}

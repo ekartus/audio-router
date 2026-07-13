@@ -183,6 +183,14 @@ public final class ProcessAudioRouter {
 
     public init() {}
 
+    /// Peak output level (0…1) since the last call, then resets. Drives the UI
+    /// activity meter. Written from the realtime callback; a benign race for a meter.
+    public func readLevel() -> Float {
+        let v = meterOutPeak
+        meterOutPeak = 0
+        return v
+    }
+
     public func stop() {
         meterTimer?.cancel(); meterTimer = nil
         if let p = dacProcID, dacID != kAudioObjectUnknown {

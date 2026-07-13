@@ -8,24 +8,40 @@ No kernel extension and no virtual audio driver to install. It uses Apple's mode
 
 - Per-app routing rules: **App → Output device**, each independently toggleable.
 - Your macOS default output keeps playing everything *else* as normal — a route only siphons the one app you assign.
+- **Activity monitor** in the menu-bar popover: shows your current **default output** (where all un-routed audio goes) plus every route, with a colored status dot and a **live level meter** that moves with the audio while a route is active.
 - Menu-bar UI with live status (routing / waiting / error) per rule.
 - Rules persist across launches and **auto-reconnect** when the app or device reappears.
+
+### How routing behaves
+
+Your macOS **default output** (Sound settings / the volume menu) keeps playing *everything* as usual. Each route you add **pulls one app's audio out** of the default output (muting it at the source) and re-injects it into the device you chose. So a single route `Apple Music → USB DAC` means:
+
+| Audio | Comes out of |
+|---|---|
+| Apple Music | the USB DAC only |
+| Notifications, browser, system sounds, everything else | your default output (speakers / Bluetooth) |
+
+The app never changes your default output — it only siphons off the specific apps you route.
 
 ## Requirements
 
 - **macOS 15 (Sequoia) or newer** (the process-tap API needs 14.2+; this project targets 15).
 - **Xcode** or the **Command Line Tools** (`xcode-select --install`) to build.
 
-## Build & install
+## Build from source & install
+
+This app is distributed as **source you build yourself** (it's ad-hoc signed, not notarized, so copying a prebuilt `.app` between Macs gets quarantined — building locally avoids that and makes the audio-capture permission stick).
 
 ```bash
-git clone <your-repo-url> audio-router
+git clone https://github.com/ekartus/audio-router.git
 cd audio-router
 ./scripts/make_app.sh          # builds + bundles + ad-hoc signs
 open "dist/Audio Router.app"   # launch it
 ```
 
 To install it permanently, drag **`dist/Audio Router.app`** into `/Applications`.
+
+The `make_app.sh` script runs `swift build -c release` and assembles a menu-bar `.app` (with `LSUIElement` so there's no dock icon), then ad-hoc signs it. No Xcode project required — just the Swift toolchain.
 
 On first use, when you enable a route, macOS will ask for **Audio Recording / Audio Capture** permission — approve it. (Because the app is *ad-hoc signed*, macOS may ask again after each rebuild; that's expected for a locally built app.)
 
@@ -75,3 +91,11 @@ Sources/MixerApp/    SwiftUI MenuBarExtra app
 Sources/mixerpoc/    debug CLI
 scripts/make_app.sh  build + bundle + sign
 ```
+
+## Credits
+
+This app was designed and built by **Claude** (Anthropic's Claude Opus 4.8), running in Claude Code, pair-programming with the repository owner.
+
+Claude wrote the Core Audio engine, the SwiftUI menu-bar interface, and the packaging — and along the way diagnosed a tricky USB-DAC static bug by instrumenting the live audio path, proving the tapped samples were clean, and re-architecting from a fragile Core Audio *aggregate device* to a decoupled **tap → ring buffer → direct output** design that gives the DAC its normal IO path.
+
+Built on Apple's Core Audio process-tap API (`CATapDescription`, macOS 14.2+).

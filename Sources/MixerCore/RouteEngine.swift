@@ -10,12 +10,23 @@ import CoreAudio
 public final class RouteEngine: ObservableObject {
     @Published public private(set) var rules: [RoutingRule]
     @Published public private(set) var statuses: [UUID: RouteStatus] = [:]
+    @Published public private(set) var defaultOutput: AudioDeviceInfo?
 
     private var routers: [UUID: ProcessAudioRouter] = [:]
     private var timer: Timer?
 
+    /// Live output level (0…1) for an active route; 0 if inactive. Consuming —
+    /// call at your display rate (returns the peak since the previous call).
+    public func level(for id: UUID) -> Float {
+        routers[id]?.readLevel() ?? 0
+    }
+
+    /// Whether a rule currently has a live router.
+    public func isActive(_ id: UUID) -> Bool { routers[id] != nil }
+
     public init() {
         rules = RulesStore.load()
+        defaultOutput = defaultOutputDevice()
         for r in rules { statuses[r.id] = r.enabled ? .waiting("starting…") : .inactive }
         timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reconcile() }
@@ -58,6 +69,7 @@ public final class RouteEngine: ObservableObject {
     // MARK: Reconcile loop
 
     private func reconcile() {
+        defaultOutput = defaultOutputDevice()
         let devices = listOutputDevices()
         let processes = listAudioProcesses()
 

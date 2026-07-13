@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import MixerCore
 
 struct RunningApp: Identifiable, Hashable {
@@ -18,6 +19,30 @@ func runningApps() -> [RunningApp] {
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 }
 
+/// A segmented level meter (activity-monitor style).
+struct SegmentMeter: View {
+    var level: Float            // raw peak 0…1
+    var segments = 8
+    var gain: Float = 3.0
+
+    var body: some View {
+        let lit = Int((min(1, level * gain)) * Float(segments))
+        HStack(spacing: 2) {
+            ForEach(0..<segments, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(i < lit ? color(for: i) : Color.secondary.opacity(0.18))
+                    .frame(width: 4, height: 11)
+            }
+        }
+    }
+
+    private func color(for i: Int) -> Color {
+        if i >= segments - 2 { return .red }
+        if i >= segments - 4 { return .yellow }
+        return .green
+    }
+}
+
 struct MenuContentView: View {
     @ObservedObject var engine: RouteEngine
 
@@ -25,40 +50,18 @@ struct MenuContentView: View {
     @State private var devices: [AudioDeviceInfo] = []
     @State private var selectedBundle: String = ""
     @State private var selectedDeviceUID: String = ""
+    @State private var levels: [UUID: Float] = [:]
+
+    private let ticker = Timer.publish(every: 0.08, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "waveform")
-                Text("Audio Router").font(.headline)
-                Spacer()
-                Button {
-                    refresh()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh app & device lists")
-            }
-
+            header
             Divider()
-
-            if engine.rules.isEmpty {
-                Text("No routes yet. Add one below.")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
-            } else {
-                ForEach(engine.rules) { rule in
-                    ruleRow(rule)
-                }
-            }
-
+            activitySection
             Divider()
-
             addRuleForm
-
             Divider()
-
             HStack {
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
@@ -66,44 +69,104 @@ struct MenuContentView: View {
             }
         }
         .padding(14)
-        .frame(width: 360)
+        .frame(width: 380)
         .onAppear(perform: refresh)
+        .onReceive(ticker) { _ in
+            for rule in engine.rules {
+                let v = engine.level(for: rule.id)
+                levels[rule.id] = max(v, (levels[rule.id] ?? 0) * 0.75)   // smooth decay
+            }
+        }
     }
 
-    // MARK: Rule row
+    private var header: some View {
+        HStack {
+            Image(systemName: "waveform")
+            Text("Audio Router").font(.headline)
+            Spacer()
+            Button(action: refresh) { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless)
+                .help("Refresh app & device lists")
+        }
+    }
+
+    // MARK: Activity monitor
+
+    private var activitySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("ACTIVITY").font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
+
+            // Default path — where everything un-routed goes.
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.wave.2.fill").foregroundStyle(.secondary).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Everything else").fontWeight(.medium)
+                    Text(engine.defaultOutput?.name ?? "—")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("System default")
+                    .font(.caption2)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(8)
+            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+
+            // Routes.
+            if engine.rules.isEmpty {
+                Text("No routes yet — add one below.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+            } else {
+                ForEach(engine.rules) { rule in
+                    routeRow(rule)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
-    private func ruleRow(_ rule: RoutingRule) -> some View {
+    private func routeRow(_ rule: RoutingRule) -> some View {
         let status = engine.statuses[rule.id] ?? .inactive
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Text(rule.appName).fontWeight(.medium)
-                    Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
-                    Text(rule.deviceName).foregroundStyle(.secondary)
+        let active = engine.isActive(rule.id)
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: "app.dashed").foregroundStyle(.secondary).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(rule.appName).fontWeight(.medium)
+                        Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
+                        Text(rule.deviceName).foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 5) {
+                        Circle().fill(statusColor(status)).frame(width: 7, height: 7)
+                        Text(status.label).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-                HStack(spacing: 5) {
-                    Circle().fill(statusColor(status)).frame(width: 7, height: 7)
-                    Text(status.label).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            Spacer()
-            Toggle("", isOn: Binding(
-                get: { rule.enabled },
-                set: { engine.setEnabled(rule.id, $0) }
-            ))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { rule.enabled },
+                    set: { engine.setEnabled(rule.id, $0) }
+                ))
+                .labelsHidden().toggleStyle(.switch).controlSize(.small)
 
-            Button {
-                engine.remove(rule.id)
-            } label: {
-                Image(systemName: "trash").foregroundStyle(.secondary)
+                Button { engine.remove(rule.id) } label: {
+                    Image(systemName: "trash").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
             }
-            .buttonStyle(.borderless)
+            // Live meter only while the route is actually running.
+            if active {
+                SegmentMeter(level: levels[rule.id] ?? 0)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 26)
+            }
         }
-        .padding(.vertical, 3)
+        .padding(8)
+        .background(active ? Color.green.opacity(0.06) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func statusColor(_ s: RouteStatus) -> Color {
@@ -119,27 +182,17 @@ struct MenuContentView: View {
 
     private var addRuleForm: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Add route").font(.subheadline).fontWeight(.semibold)
-            HStack {
-                Picker("App", selection: $selectedBundle) {
-                    Text("Choose app…").tag("")
-                    ForEach(apps) { app in Text(app.name).tag(app.id) }
-                }
-                .labelsHidden()
-            }
-            HStack {
-                Picker("Output", selection: $selectedDeviceUID) {
-                    Text("Choose output…").tag("")
-                    ForEach(devices) { dev in Text(dev.name).tag(dev.uid) }
-                }
-                .labelsHidden()
-            }
-            Button {
-                addRule()
-            } label: {
-                Label("Add route", systemImage: "plus")
-            }
-            .disabled(selectedBundle.isEmpty || selectedDeviceUID.isEmpty)
+            Text("ADD ROUTE").font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
+            Picker("App", selection: $selectedBundle) {
+                Text("Choose app…").tag("")
+                ForEach(apps) { app in Text(app.name).tag(app.id) }
+            }.labelsHidden()
+            Picker("Output", selection: $selectedDeviceUID) {
+                Text("Choose output…").tag("")
+                ForEach(devices) { dev in Text(dev.name).tag(dev.uid) }
+            }.labelsHidden()
+            Button(action: addRule) { Label("Add route", systemImage: "plus") }
+                .disabled(selectedBundle.isEmpty || selectedDeviceUID.isEmpty)
         }
     }
 
