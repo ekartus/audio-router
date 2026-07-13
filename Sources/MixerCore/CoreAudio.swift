@@ -43,7 +43,11 @@ enum CA {
                                                  mElement: kAudioObjectPropertyElementMain)
         var value = def
         var dataSize = UInt32(MemoryLayout<T>.size)
-        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, &value)
+        // Explicit raw-bytes access avoids the "UnsafeMutableRawPointer to a value
+        // of type T" warning; callers only ever pass POD numeric types.
+        let status = withUnsafeMutableBytes(of: &value) { raw in
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, raw.baseAddress!)
+        }
         return status == noErr ? value : nil
     }
 
