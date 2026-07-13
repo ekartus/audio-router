@@ -26,6 +26,7 @@ public final class ProcessAudioRouter {
 
     private var ring: AudioRingBuffer?
     private var prerollFrames = 0
+    private var maxFillFrames = 0  // high-water mark for drift compensation
     private var draining = false   // consumer state: false until buffer pre-fills
     private var lastFrame: [Float] = []
 
@@ -157,12 +158,14 @@ public final class ProcessAudioRouter {
         status = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &captureAggID)
         guard status == noErr, captureAggID != kAudioObjectUnknown else { throw RouterError.aggregateCreateFailed(status) }
 
-        // 4. Ring buffer: ~500ms capacity, start draining once ~120ms buffered.
-        let capacityFrames = Int(sampleRate * 0.5)
+        // 4. Ring buffer: ~1s capacity, start draining once ~150ms buffered.
+        //    The high-water mark keeps long-session clock drift bounded.
+        let capacityFrames = Int(sampleRate * 1.0)
         guard capacityFrames > 0 else { throw RouterError.unsupportedFormat("invalid buffer capacity") }
         let ring = AudioRingBuffer(capacityFrames: capacityFrames, channels: channels)
         self.ring = ring
-        prerollFrames = Int(sampleRate * 0.12)
+        prerollFrames = Int(sampleRate * 0.15)
+        maxFillFrames = Int(sampleRate * 0.45)
         draining = false
         lastFrame = Array(repeating: 0, count: channels)
 
@@ -199,14 +202,18 @@ public final class ProcessAudioRouter {
 
             let fillBeforeRead = ring.fillFrames
             let lowWater = ring.capacityFrames / 5
-            let highWater = ring.capacityFrames * 4 / 5
             let repeatFrame = fillBeforeRead <= lowWater && frames > 1
             let framesToRead = repeatFrame ? frames - 1 : frames
             let underflow = ring.read(fp, frames: framesToRead)
             if repeatFrame && underflow == 0 {
                 for c in 0..<ring.channels { fp[(frames - 1) * ring.channels + c] = self.lastFrame[c] }
             }
-            if fillBeforeRead >= highWater && underflow == 0 { ring.discard(frames: 1) }
+            // Gradually discard one oldest frame while above the 450 ms
+            // high-water mark. This bounds latency without a large audible skip.
+            if fillBeforeRead > self.maxFillFrames && underflow == 0 {
+                ring.discard(frames: 1)
+                self.updateMeter { self.meterOverflows += 1 }
+            }
             if underflow > 0 {
                 self.updateMeter { self.meterUnderflows += underflow }
                 if ring.fillFrames == 0 { self.draining = false }   // re-buffer
