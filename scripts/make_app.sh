@@ -6,6 +6,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 CONFIG="${1:-release}"
+# Guard against a stray/invalid arg (e.g. a pasted `#` comment under zsh, which
+# doesn't strip interactive comments) — fall back to release rather than failing.
+case "$CONFIG" in
+    debug|release) ;;
+    *) echo "▸ Ignoring invalid configuration '$CONFIG'; using release." ; CONFIG="release" ;;
+esac
 APP_NAME="Audio Router"
 BUNDLE_ID="com.mixerapp.AudioRouter"
 BUILD_DIR=".build/$CONFIG"

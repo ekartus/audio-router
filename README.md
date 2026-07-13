@@ -35,9 +35,11 @@ This app is distributed as **source you build yourself** (it's ad-hoc signed, no
 ```bash
 git clone https://github.com/ekartus/audio-router.git
 cd audio-router
-./scripts/make_app.sh          # builds + bundles + ad-hoc signs
-open "dist/Audio Router.app"   # launch it
+./scripts/make_app.sh
+open "dist/Audio Router.app"
 ```
+
+`make_app.sh` builds, bundles, and ad-hoc signs the app; `open` launches it.
 
 To install it permanently, drag **`dist/Audio Router.app`** into `/Applications`.
 
@@ -73,9 +75,12 @@ A command-line tool is included for troubleshooting:
 
 ```bash
 swift build
-.build/debug/mixerpoc list                                  # list devices + audio processes
-.build/debug/mixerpoc route --app com.apple.Music --device Combo384   # route one app (verbose meter)
+.build/debug/mixerpoc list
+.build/debug/mixerpoc route --app com.apple.Music --device Combo384
 ```
+
+- `list` — print output devices and audio-producing processes.
+- `route` — route one app to a device, with a verbose live meter.
 
 ## Troubleshooting
 
